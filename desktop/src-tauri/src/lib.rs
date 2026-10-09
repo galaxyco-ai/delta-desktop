@@ -6,13 +6,19 @@
 //! Signed-in users are redirected from /sign-in to the app by Clerk.
 //! Only the canonical host is allowed. Do not point this at any other deployment.
 
-use tauri::menu::{Menu, MenuItem};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use tauri::menu::{CheckMenuItem, Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Manager, WebviewWindow};
+use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_updater::UpdaterExt;
+use tauri_plugin_window_state::{AppHandleExt, StateFlags};
 use url::Url;
 
 const PROD_ORIGIN: &str = "https://delta.galaxyco.ai";
@@ -105,52 +111,219 @@ fn notify(app: &tauri::AppHandle, title: &str, body: &str) {
     }
 }
 
-fn check_for_updates(app: tauri::AppHandle) {
+// ---------------------------------------------------------------------------
+// Silent auto-update
+//
+// Policy (also documented in desktop/README.md):
+// 1. About 5 seconds after launch, check the endpoint. If an update exists it
+//    is downloaded and installed right away, because the app has only just
+//    opened and nothing is lost by restarting.
+// 2. While running, check again every 4 hours. A found update is downloaded
+//    in the background and held until a quiet moment: the main window is
+//    hidden to the tray, minimized, or has not had focus for 15 minutes.
+//    That condition is re-evaluated every minute.
+// 3. Install runs the NSIS installer in quiet mode (`/S /UPDATE /R`). The app
+//    exits, the per-user installer replaces files with no UI and no admin
+//    prompt, then relaunches Delta with the same command-line arguments.
+// 4. On the first launch of a new version, a single toast says
+//    "Delta updated to vX". There are no prompts or confirmation dialogs.
+// Debug builds never auto-update.
+// ---------------------------------------------------------------------------
+
+const STARTUP_CHECK_DELAY: Duration = Duration::from_secs(5);
+const PERIODIC_CHECK_INTERVAL: Duration = Duration::from_secs(4 * 60 * 60);
+const QUIET_POLL_INTERVAL: Duration = Duration::from_secs(60);
+const UNFOCUSED_IDLE: Duration = Duration::from_secs(15 * 60);
+const VERSION_MARKER: &str = "last-run-version";
+/// Written just before a background install when the window is out of sight,
+/// so the relaunched app stays in the tray instead of popping up.
+const START_HIDDEN_MARKER: &str = "start-hidden-once";
+
+static UPDATE_BUSY: AtomicBool = AtomicBool::new(false);
+static WINDOW_FOCUSED: AtomicBool = AtomicBool::new(true);
+static LAST_FOCUS_CHANGE: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Window size, position and maximized state are persisted. Visibility is not:
+/// launch code decides whether to show the window or stay in the tray.
+fn window_state_flags() -> StateFlags {
+    StateFlags::all() - StateFlags::VISIBLE
+}
+
+fn record_focus(focused: bool) {
+    WINDOW_FOCUSED.store(focused, Ordering::SeqCst);
+    if let Ok(mut guard) = LAST_FOCUS_CHANGE.lock() {
+        *guard = Some(Instant::now());
+    }
+}
+
+/// True when restarting now is unlikely to interrupt the user.
+fn is_quiet_moment(app: &tauri::AppHandle) -> bool {
+    let Some(window) = app.get_webview_window(MAIN_WINDOW) else {
+        return true;
+    };
+    if !window.is_visible().unwrap_or(true) || window.is_minimized().unwrap_or(false) {
+        return true;
+    }
+    if WINDOW_FOCUSED.load(Ordering::SeqCst) {
+        return false;
+    }
+    LAST_FOCUS_CHANGE
+        .lock()
+        .ok()
+        .and_then(|guard| *guard)
+        .map(|since| since.elapsed() >= UNFOCUSED_IDLE)
+        .unwrap_or(false)
+}
+
+/// Installs the downloaded update. On Windows this launches the quiet NSIS
+/// installer and exits the process; the installer relaunches Delta.
+fn apply_update(app: &tauri::AppHandle, update: &tauri_plugin_updater::Update, bytes: &[u8]) {
+    let _ = app.save_window_state(window_state_flags());
+    let out_of_sight = app
+        .get_webview_window(MAIN_WINDOW)
+        .map(|w| !w.is_visible().unwrap_or(true) || w.is_minimized().unwrap_or(false))
+        .unwrap_or(false);
+    if out_of_sight {
+        if let Ok(dir) = app.path().app_config_dir() {
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(dir.join(START_HIDDEN_MARKER), "1");
+        }
+    }
+    if let Err(error) = update.install(bytes) {
+        eprintln!("delta-desktop: update install failed: {error}");
+        return;
+    }
+    // Only reached on platforms where install does not exit the process.
+    app.restart();
+}
+
+/// Checks for an update and, if one exists, downloads and installs it.
+/// `wait_for_quiet` holds the install until `is_quiet_moment` is true.
+/// Returns Ok(false) when already up to date.
+async fn update_once(app: &tauri::AppHandle, wait_for_quiet: bool) -> Result<bool, String> {
+    if UPDATE_BUSY.swap(true, Ordering::SeqCst) {
+        return Ok(true);
+    }
+    let result = async {
+        let updater = app.updater().map_err(|e| e.to_string())?;
+        let Some(update) = updater.check().await.map_err(|e| e.to_string())? else {
+            return Ok(false);
+        };
+        let bytes = update
+            .download(|_, _| {}, || {})
+            .await
+            .map_err(|e| e.to_string())?;
+        if wait_for_quiet {
+            while !is_quiet_moment(app) {
+                tokio::time::sleep(QUIET_POLL_INTERVAL).await;
+            }
+        }
+        apply_update(app, &update, &bytes);
+        Ok(true)
+    }
+    .await;
+    UPDATE_BUSY.store(false, Ordering::SeqCst);
+    result
+}
+
+fn start_auto_updater(app: tauri::AppHandle) {
+    if cfg!(debug_assertions) {
+        return;
+    }
     tauri::async_runtime::spawn(async move {
-        match app.updater() {
-            Ok(updater) => match updater.check().await {
-                Ok(Some(update)) => {
-                    notify(
-                        &app,
-                        "Delta update available",
-                        &format!("Version {} is ready. Use Check for updates in the tray to install.", update.version),
-                    );
-                }
-                Ok(None) => {}
-                Err(error) => eprintln!("delta-desktop: updater check failed: {error}"),
-            },
-            Err(error) => eprintln!("delta-desktop: updater unavailable: {error}"),
+        tokio::time::sleep(STARTUP_CHECK_DELAY).await;
+        if let Err(error) = update_once(&app, false).await {
+            eprintln!("delta-desktop: startup update failed: {error}");
+        }
+        loop {
+            tokio::time::sleep(PERIODIC_CHECK_INTERVAL).await;
+            if let Err(error) = update_once(&app, true).await {
+                eprintln!("delta-desktop: periodic update failed: {error}");
+            }
         }
     });
 }
 
-fn install_update(app: tauri::AppHandle) {
+/// Tray "Check for updates": the user asked, so install immediately.
+fn manual_update(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
-        let updater = match app.updater() {
-            Ok(updater) => updater,
-            Err(error) => {
-                notify(&app, "Delta", &format!("Updater unavailable: {error}"));
-                return;
-            }
-        };
-        match updater.check().await {
-            Ok(Some(update)) => {
-                notify(
-                    &app,
-                    "Delta",
-                    &format!("Downloading version {}.", update.version),
-                );
-                if let Err(error) = update.download_and_install(|_, _| {}, || {}).await {
-                    notify(&app, "Delta", &format!("Update failed: {error}"));
-                    return;
-                }
-                notify(&app, "Delta", "Update installed. Restarting.");
-                app.restart();
-            }
-            Ok(None) => notify(&app, "Delta", "You are on the latest desktop build."),
+        match update_once(&app, false).await {
+            Ok(true) => {}
+            Ok(false) => notify(&app, "Delta", "You are on the latest version."),
             Err(error) => notify(&app, "Delta", &format!("Update check failed: {error}")),
         }
     });
+}
+
+/// Shows "Delta updated to vX" once, on the first launch of a new version.
+fn announce_new_version(app: &tauri::AppHandle) {
+    let current = app.package_info().version.to_string();
+    let Ok(dir) = app.path().app_config_dir() else {
+        return;
+    };
+    let marker = dir.join(VERSION_MARKER);
+    let previous = std::fs::read_to_string(&marker).ok();
+    if previous.as_deref().map(str::trim) != Some(current.as_str()) {
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(&marker, &current);
+        // No marker means a fresh install (or an upgrade from 0.1.1 or older,
+        // which never wrote one). Only announce real upgrades.
+        if previous.is_some() {
+            notify(app, "Delta", &format!("Delta updated to v{current}"));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Start with Windows
+//
+// Enabled by default on the first run of a build that has this feature (a
+// marker file records that the default was applied, so turning it off in the
+// tray sticks). Login launches pass `--autostart` and start hidden in the tray.
+// ---------------------------------------------------------------------------
+
+const AUTOSTART_ARG: &str = "--autostart";
+const AUTOSTART_MARKER: &str = "autostart-default-applied";
+
+fn launched_by_autostart() -> bool {
+    std::env::args().any(|arg| arg == AUTOSTART_ARG)
+}
+
+/// True (once) if the previous run asked this launch to stay in the tray.
+fn take_start_hidden_marker(app: &tauri::AppHandle) -> bool {
+    let Ok(dir) = app.path().app_config_dir() else {
+        return false;
+    };
+    std::fs::remove_file(dir.join(START_HIDDEN_MARKER)).is_ok()
+}
+
+fn apply_autostart_default(app: &tauri::AppHandle) {
+    if cfg!(debug_assertions) {
+        return;
+    }
+    let Ok(dir) = app.path().app_config_dir() else {
+        return;
+    };
+    let marker = dir.join(AUTOSTART_MARKER);
+    if marker.exists() {
+        return;
+    }
+    if let Err(error) = app.autolaunch().enable() {
+        eprintln!("delta-desktop: enabling autostart failed: {error}");
+        return;
+    }
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(&marker, "1");
+}
+
+fn toggle_autostart(app: &tauri::AppHandle, item: &CheckMenuItem<tauri::Wry>) {
+    let manager = app.autolaunch();
+    let enabled = manager.is_enabled().unwrap_or(false);
+    let result = if enabled { manager.disable() } else { manager.enable() };
+    if let Err(error) = result {
+        eprintln!("delta-desktop: toggling autostart failed: {error}");
+    }
+    let _ = item.set_checked(manager.is_enabled().unwrap_or(!enabled));
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -164,12 +337,20 @@ pub fn run() {
                 }
             }
         }))
-        .plugin(tauri_plugin_window_state::Builder::default().build())
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_state_flags(window_state_flags())
+                .build(),
+        )
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            Some(vec![AUTOSTART_ARG]),
+        ))
         .setup(|app| {
             let handle = app.handle().clone();
 
@@ -191,6 +372,15 @@ pub fn run() {
             )?;
             let update_item =
                 MenuItem::with_id(app, "check-updates", "Check for updates", true, None::<&str>)?;
+            apply_autostart_default(&handle);
+            let autostart_item = CheckMenuItem::with_id(
+                app,
+                "autostart",
+                "Start with Windows",
+                true,
+                app.autolaunch().is_enabled().unwrap_or(false),
+                None::<&str>,
+            )?;
             let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
             let menu = Menu::with_items(
                 app,
@@ -200,6 +390,7 @@ pub fn run() {
                     &sign_in_item,
                     &notify_item,
                     &update_item,
+                    &autostart_item,
                     &quit_item,
                 ],
             )?;
@@ -209,7 +400,7 @@ pub fn run() {
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .tooltip("Delta")
-                .on_menu_event(|app, event| match event.id.as_ref() {
+                .on_menu_event(move |app, event| match event.id.as_ref() {
                     "show" => show_main_window(app),
                     "hide" => hide_main_window(app),
                     "sign-in-browser" => {
@@ -221,7 +412,8 @@ pub fn run() {
                     "test-notification" => {
                         notify(app, "Delta", "Native notifications are working.");
                     }
-                    "check-updates" => install_update(app.clone()),
+                    "check-updates" => manual_update(app.clone()),
+                    "autostart" => toggle_autostart(app, &autostart_item),
                     "quit" => app.exit(0),
                     _ => {}
                 })
@@ -252,14 +444,25 @@ pub fn run() {
                 }
             }
 
-            check_for_updates(handle);
+            // The window starts hidden (tauri.conf.json) so a login launch, or a
+            // relaunch after a background update, can stay in the tray without a
+            // flash. Show it for normal launches.
+            let stay_hidden = take_start_hidden_marker(&handle) || launched_by_autostart();
+            if !stay_hidden {
+                show_main_window(&handle);
+            }
+
+            announce_new_version(&handle);
+            start_auto_updater(handle);
             Ok(())
         })
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+        .on_window_event(|window, event| match event {
+            tauri::WindowEvent::CloseRequested { api, .. } => {
                 api.prevent_close();
                 let _ = window.hide();
             }
+            tauri::WindowEvent::Focused(focused) => record_focus(*focused),
+            _ => {}
         })
         .run(tauri::generate_context!())
         .expect("error while running Delta desktop");
