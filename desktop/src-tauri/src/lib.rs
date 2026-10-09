@@ -1,6 +1,9 @@
 //! Thin Windows shell around the Delta web app.
 //!
-//! Production loads https://delta.galaxyco.ai. Dev loads http://localhost:3000.
+//! Production opens https://delta.galaxyco.ai/sign-in. Dev opens http://localhost:3000/sign-in.
+//! The start page is set by `app.windows[0].url` ("sign-in") in tauri.conf.json,
+//! resolved against `build.frontendDist` (release) or `build.devUrl` (dev).
+//! Signed-in users are redirected from /sign-in to the app by Clerk.
 //! Only the canonical host is allowed. Do not point this at any other deployment.
 
 use tauri::menu::{Menu, MenuItem};

@@ -1,7 +1,7 @@
 {
   "name": "delta-desktop",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Thin Tauri v2 Windows shell for Delta at https://delta.galaxyco.ai",
   "license": "UNLICENSED",
   "type": "module",

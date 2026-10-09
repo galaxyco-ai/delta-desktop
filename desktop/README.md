@@ -2,14 +2,16 @@
 
 Thin [Tauri v2](https://v2.tauri.app/) shell around the Delta web app at
 **https://delta.galaxyco.ai**. It does not bundle the web app. Release builds
-load the live site and dev builds load `http://localhost:3000`.
+open the sign-in page at `https://delta.galaxyco.ai/sign-in` and dev builds open
+`http://localhost:3000/sign-in`. Users who already have a session are sent on to
+the app by Clerk.
 
 ## What works in V1
 
 | Feature | Behaviour |
 | --- | --- |
 | Window | 1280x800, minimum 900x600. Position and size are restored by `tauri-plugin-window-state`. Closing hides to the tray instead of quitting. |
-| Load URL | Release builds open `https://delta.galaxyco.ai`. `npm run dev` opens `http://localhost:3000`. |
+| Start page | Release builds open `https://delta.galaxyco.ai/sign-in`. `npm run dev` opens `http://localhost:3000/sign-in`. Set by `app.windows[0].url` (`"sign-in"`) in `tauri.conf.json`, resolved against `frontendDist` / `devUrl`. A signed-in user is redirected to the workspace. |
 | System tray | Left-click shows the window. Menu: Show, Hide, Sign in in browser, Test notification, Check for updates, Quit. |
 | Notifications | Native Windows toasts via the notification plugin. The loaded site can call them (see [Notification bridge](#notification-bridge)). Capability is scoped to `delta.galaxyco.ai` and `localhost:3000`. |
 | Deep links | Registers `delta://`. `delta://auth?ticket=...` focuses the window and navigates to `/desktop/auth/consume?ticket=...` on the current origin. The matching web routes are not built yet (see [Sign-in](#sign-in)). |
@@ -24,7 +26,7 @@ and Node.
 ```bash
 cd desktop
 npm install
-npm run dev     # tauri dev, loads http://localhost:3000 (run the web app there first)
+npm run dev     # tauri dev, opens http://localhost:3000/sign-in (run the web app there first)
 npm run build   # release build, unsigned
 ```
 
