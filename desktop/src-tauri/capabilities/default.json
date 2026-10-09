@@ -1,0 +1,20 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default capabilities for the Delta shell. Remote API access is limited to the canonical host and local Next.js.",
+  "windows": ["main"],
+  "remote": {
+    "urls": ["https://delta.galaxyco.ai/*", "http://localhost:3000/*"]
+  },
+  "permissions": [
+    "core:default",
+    "core:window:default",
+    "core:webview:default",
+    "notification:default",
+    "deep-link:default",
+    "updater:default",
+    "window-state:default",
+    "opener:default",
+    "process:default"
+  ]
+}

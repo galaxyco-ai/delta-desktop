@@ -1,0 +1,7 @@
+node_modules/
+desktop/src-tauri/target/
+desktop/src-tauri/gen/schemas/
+*.exe
+*.msi
+*.sig
+.DS_Store

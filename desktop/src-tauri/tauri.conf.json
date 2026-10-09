@@ -1,0 +1,69 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Delta",
+  "version": "0.1.0",
+  "identifier": "ai.galaxyco.delta",
+  "build": {
+    "frontendDist": "https://delta.galaxyco.ai",
+    "devUrl": "http://localhost:3000"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "security": {
+      "csp": null
+    },
+    "windows": [
+      {
+        "label": "main",
+        "title": "Delta",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 600,
+        "resizable": true,
+        "fullscreen": false,
+        "dragDropEnabled": false
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis", "msi"],
+    "publisher": "GalaxyCo",
+    "category": "Business",
+    "shortDescription": "Delta desktop shell",
+    "longDescription": "Windows shell for the Delta client-operations platform at https://delta.galaxyco.ai.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "certificateThumbprint": null,
+      "digestAlgorithm": "sha256",
+      "timestampUrl": "",
+      "nsis": {
+        "installMode": "currentUser",
+        "displayLanguageSelector": false
+      }
+    },
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEVBOEZDODEwNTE2MTY3QUIKUldTcloyRlJFTWlQNmtOaWVKNVZtMVFqSFFYc21UajQyaTBNUHlqVlVPc0xkVUxnOUpaVFFzWFYK",
+      "endpoints": [
+        "https://github.com/galaxyco-ai/delta-desktop/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    },
+    "deep-link": {
+      "desktop": {
+        "schemes": ["delta"]
+      }
+    }
+  }
+}
